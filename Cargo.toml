@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 datafusion = "54.0.0"
-arrow = "59.0.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 url = "2.5.8"
 async-trait = "0.1.89"
+t4 = "0.1.7"
+futures-core = "0.3.32"

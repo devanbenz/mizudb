@@ -1,15 +1,18 @@
+mod object_store;
+
+use crate::object_store::MizuObjectStoreRegistry;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::common::DataFusionError;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion::object_store::memory::InMemory;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
+use url::Url;
 
-struct MizuSchemaProvider {
+pub struct MizuSchemaProvider {
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
 
@@ -44,7 +47,7 @@ impl SchemaProvider for MizuSchemaProvider {
     }
 }
 
-struct MizuCatalog {
+pub struct MizuCatalog {
     tables: Vec<String>,
     files: Vec<String>,
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
@@ -82,21 +85,19 @@ impl CatalogProvider for MizuCatalog {
     }
 }
 
-async fn bootstrap_rt_ctx() -> datafusion::error::Result<Arc<SessionContext>> {
-    let rt = RuntimeEnvBuilder::default().build()?;
-    // let url = url::Url::try_from("").unwrap();
-    // rt.register_object_store(&url, Arc::new(InMemory::new()));
+pub async fn bootstrap_rt_ctx() -> datafusion::error::Result<Arc<SessionContext>> {
+    let object_store_registry = Arc::new(MizuObjectStoreRegistry::with_default_store(Arc::new(InMemory::new()), Url::try_from("file://").unwrap(), "".to_string()));
+    let rt = RuntimeEnvBuilder::default().with_object_store_registry(object_store_registry).build()?;
 
     let session_config = SessionConfig::new();
     let ctx = SessionContext::new_with_config_rt(session_config, Arc::new(rt));
-    ctx.register_parquet("test", "<TODO>", ParquetReadOptions::new()).await?;
-
-    let catalog = MizuCatalog::new();
-    let table_path = ListingTableUrl::parse("iris.parquet").unwrap();
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    let config = ListingTableConfig::new(table_path).with_listing_options(listing_options).infer_schema(&ctx.state()).await?;
-    let table_provider = Arc::new(ListingTable::try_new(config)?);
-
+    let catalog = Arc::new(MizuCatalog::new());
+    ctx.register_catalog("mizu", catalog.clone());
+    ctx.sql("CREATE SCHEMA mizu").await?;
+    ctx.sql("CREATE TABLE mizu.test (a int)").await?;
+    ctx.sql("INSERT INTO mizu.test VALUES (1)").await?;
+    ctx.sql("SELECT * FROM mizu.test").await?;
+    println!("{:?}", catalog.schema_names());
 
     Ok(Arc::new(ctx))
 }
