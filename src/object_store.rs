@@ -5,11 +5,13 @@ use datafusion::object_store::path::Path;
 use datafusion::object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::Bytes;
 use std::sync::{Arc, RwLock};
 use url::Url;
 
 pub struct MizuObjectStore {
     inner: Arc<t4::Store>,
+    indices: Arc<RwLock<HashMap<String, Vec<usize>>>>,
 }
 
 impl MizuObjectStore {
@@ -17,6 +19,7 @@ impl MizuObjectStore {
         let store = t4::mount(path).await?;
         Ok(Self {
             inner: Arc::new(store),
+            indices: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -35,8 +38,27 @@ impl Display for MizuObjectStore {
 
 #[async_trait]
 impl ObjectStore for MizuObjectStore {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> datafusion::object_store::Result<PutResult> {
-        todo!()
+    async fn put_opts(&self, location: &Path, payload: PutPayload, _: PutOptions) -> datafusion::object_store::Result<PutResult> {
+        for p in payload.as_ref() {
+            println!("Location: {:?}, Bytes: {:?}", location, p);
+        }
+
+        Ok(PutResult {
+            e_tag: None,
+            version: None,
+        })
+        // let value_bytes = Bytes::from(payload);
+        // match self.inner.put(location.to_string(), r).await {
+        //     Ok(_) => {
+        //         Ok(PutResult { e_tag: None, version: None })
+        //     }
+        //     Err(err) => {
+        //         Err(datafusion::object_store::Error::Generic {
+        //             store: "",
+        //             source: Box::new(err),
+        //         })
+        //     }
+        // }
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> datafusion::object_store::Result<Box<dyn MultipartUpload>> {

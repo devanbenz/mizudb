@@ -1,111 +1,167 @@
+mod catalog;
+mod data_sink;
 mod object_store;
+mod wal;
 
+use crate::catalog::{MizuCatalog, MizuSchemaProvider};
 use crate::object_store::MizuObjectStoreRegistry;
-use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
-use datafusion::common::DataFusionError;
+use datafusion::catalog::CatalogProvider;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::{DdlStatement, DmlStatement, LogicalPlan};
 use datafusion::object_store::memory::InMemory;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, RwLock};
+use datafusion::sql::TableReference;
+use datafusion::sql::parser::DFParser;
+use std::io::Write;
+use std::sync::Arc;
 use url::Url;
 
-pub struct MizuSchemaProvider {
-    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+struct MizuDB {
+    catalog: Arc<dyn CatalogProvider>,
+    session_ctx: SessionContext,
 }
 
-impl Debug for MizuSchemaProvider {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MizuSchemaProvider {{ tables: {:?} }}", self.tables)
+impl MizuDB {
+    fn new(catalog: Arc<dyn CatalogProvider>) -> datafusion::error::Result<Self> {
+        let object_store_registry = Arc::new(MizuObjectStoreRegistry::with_default_store(
+            Arc::new(InMemory::new()),
+            Url::try_from("file://").unwrap(),
+            "".to_string(),
+        ));
+        let rt = RuntimeEnvBuilder::default()
+            .with_object_store_registry(object_store_registry)
+            .build()?;
+
+        let session_config = SessionConfig::new();
+        let session_ctx = SessionContext::new_with_config_rt(session_config, Arc::new(rt));
+        session_ctx.register_catalog("mizu", catalog.clone());
+
+        Ok(Self {
+            catalog,
+            session_ctx,
+        })
+    }
+
+    fn ctx(&self) -> &SessionContext {
+        &self.session_ctx
+    }
+
+    fn catalog(&self) -> &Arc<dyn CatalogProvider> {
+        &self.catalog
+    }
+
+    async fn exec(&self, sql: &str) -> datafusion::error::Result<()> {
+        match DFParser::parse_sql(sql) {
+            Ok(stmts) => {
+                for stmt in stmts {
+                    match self.ctx().state().statement_to_plan(stmt).await? {
+                        LogicalPlan::Ddl(ddl) => match ddl {
+                            DdlStatement::CreateExternalTable(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::CreateMemoryTable(stmt) => {
+                                let schema =
+                                    stmt.name.schema().or_else(|| Some("default")).unwrap();
+                                let schema_ref = stmt.input.schema();
+                                let listing_table_provider = ListingTable::try_new(
+                                    ListingTableConfig::new(ListingTableUrl::parse("file://")?)
+                                        .with_listing_options(ListingOptions::new(Arc::new(
+                                            ParquetFormat::new(),
+                                        )))
+                                        .with_schema(schema_ref.inner().clone()),
+                                )?;
+
+                                self.ctx().register_table(
+                                    stmt.name.clone(),
+                                    Arc::new(listing_table_provider.clone()),
+                                )?;
+                                for cat in self.ctx().catalog_names() {
+                                    let c = self.ctx().catalog(&cat).unwrap();
+                                    for sch in c.schema_names() {
+                                        let s = c.schema(&sch).unwrap();
+                                        println!("{cat}.{sch}: {:?}", s.table_names());
+                                    }
+                                }
+                            }
+                            DdlStatement::CreateView(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::CreateCatalogSchema(stmt) => {
+                                println!("{:#?}", stmt);
+                                let parsed = TableReference::from(stmt.schema_name.as_str());
+                                let schema_name = parsed.table();
+                                let provider = Arc::new(MizuSchemaProvider::new());
+                                self.catalog().register_schema(schema_name, provider)?;
+                            }
+                            DdlStatement::CreateCatalog(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::CreateIndex(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::DropTable(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::DropView(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::DropCatalogSchema(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::CreateFunction(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                            DdlStatement::DropFunction(stmt) => {
+                                println!("{:#?}", stmt);
+                            }
+                        },
+                        LogicalPlan::Dml(dml) => match dml {
+                            DmlStatement { .. } => {
+                                println!("{:#?}", dml);
+                            }
+                        },
+                        plan => {
+                            self.ctx().execute_logical_plan(plan).await?;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                println!("{:#?}", err);
+            }
+        };
+
+        Ok(())
     }
 }
 
-#[async_trait]
-impl SchemaProvider for MizuSchemaProvider {
-    fn table_names(&self) -> Vec<String> {
-        self.tables.read().unwrap().keys().cloned().collect()
-    }
+fn prompt(text: &str) -> String {
+    print!("{} ", text);
+    std::io::stdout().flush().expect("error flushing stdout");
 
-    async fn table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        if let Some(table) = self.tables.read().unwrap().get(name) {
-            Ok(Some(table.clone()))
-        } else {
-            Ok(None)
-        }
-    }
+    let mut response = String::new();
+    std::io::stdin()
+        .read_line(&mut response)
+        .expect("failed to get input");
 
-    fn register_table(&self, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        let mut tables = self.tables.write().unwrap();
-        tables.insert(name, table.clone());
-        Ok(Some(table))
-    }
-
-    fn table_exist(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_key(name)
-    }
-}
-
-pub struct MizuCatalog {
-    tables: Vec<String>,
-    files: Vec<String>,
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
-}
-
-impl MizuCatalog {
-    fn new() -> Self {
-        Self {
-            schemas: HashMap::new(),
-            tables: vec![],
-            files: vec![],
-        }
-    }
-}
-
-impl Debug for MizuCatalog {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MizuCatalog {{ tables: {:?}, files: {:?}, schemas: {:?} }}", self.tables, self.files, self.schemas)
-    }
-}
-
-impl CatalogProvider for MizuCatalog {
-    fn schema_names(&self) -> Vec<String> {
-        self.schemas.keys().cloned().collect()
-    }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
-    }
-
-    fn register_schema(&self, name: &str, schema: Arc<dyn SchemaProvider>) -> datafusion::common::Result<Option<Arc<dyn SchemaProvider>>> {
-        let mut schema_map = self.schemas.clone();
-        schema_map.insert(name.to_string(), schema.clone());
-        Ok(Some(schema))
-    }
-}
-
-pub async fn bootstrap_rt_ctx() -> datafusion::error::Result<Arc<SessionContext>> {
-    let object_store_registry = Arc::new(MizuObjectStoreRegistry::with_default_store(Arc::new(InMemory::new()), Url::try_from("file://").unwrap(), "".to_string()));
-    let rt = RuntimeEnvBuilder::default().with_object_store_registry(object_store_registry).build()?;
-
-    let session_config = SessionConfig::new();
-    let ctx = SessionContext::new_with_config_rt(session_config, Arc::new(rt));
-    let catalog = Arc::new(MizuCatalog::new());
-    ctx.register_catalog("mizu", catalog.clone());
-    ctx.sql("CREATE SCHEMA mizu").await?;
-    ctx.sql("CREATE TABLE mizu.test (a int)").await?;
-    ctx.sql("INSERT INTO mizu.test VALUES (1)").await?;
-    ctx.sql("SELECT * FROM mizu.test").await?;
-    println!("{:?}", catalog.schema_names());
-
-    Ok(Arc::new(ctx))
+    response.trim_end().to_string()
 }
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let ctx = bootstrap_rt_ctx().await?;
-    println!("Hello, world!");
+    let catalog = MizuCatalog::new();
+    let db = MizuDB::new(Arc::new(catalog))?;
+    loop {
+        let input = prompt("> ");
+        if input == "exit" {
+            break;
+        }
+        db.exec(input.as_str()).await?;
+    }
 
     Ok(())
 }
