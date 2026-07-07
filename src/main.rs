@@ -36,7 +36,6 @@ impl MizuDB {
         let object_store_registry = Arc::new(MizuObjectStoreRegistry::with_default_store(
             Arc::new(object_store),
             Url::try_from("file:///tmp/datafusion_tmp/").unwrap(),
-            "".to_string(),
         ));
         let rt = RuntimeEnvBuilder::default()
             .with_object_store_registry(object_store_registry)

@@ -186,7 +186,6 @@ pub struct MizuObjectStoreRegistry {
     stores: RwLock<HashMap<String, Arc<dyn ObjectStore>>>,
     default_store: Option<Arc<dyn ObjectStore>>,
     default_store_url: Option<Url>,
-    default_store_path: Option<String>,
 }
 
 impl MizuObjectStoreRegistry {
@@ -195,25 +194,23 @@ impl MizuObjectStoreRegistry {
             stores: RwLock::new(HashMap::new()),
             default_store: None,
             default_store_url: None,
-            default_store_path: None,
         }
     }
 
-    pub fn with_default_store(store: Arc<dyn ObjectStore>, url: Url, path: String) -> Self {
+    pub fn with_default_store(store: Arc<dyn ObjectStore>, url: Url) -> Self {
         let mut stores = HashMap::new();
         stores.insert(get_url_key(&url), store.clone());
         Self {
             stores: RwLock::new(stores),
             default_store: Some(store),
             default_store_url: Some(url),
-            default_store_path: Some(path),
         }
     }
 }
 
 impl Debug for MizuObjectStoreRegistry {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MizuObjectStoreRegistry {{ stores: {:?}, default_store: {:?}, default_store_url: {:?}, default_store_path: {:?} }}", self.stores, self.default_store, self.default_store_url, self.default_store_path)
+        write!(f, "MizuObjectStoreRegistry {{ stores: {:?}, default_store: {:?}, default_store_url: {:?} }}", self.stores, self.default_store, self.default_store_url)
     }
 }
 
@@ -244,7 +241,6 @@ mod tests {
         let registry = MizuObjectStoreRegistry::with_default_store(
             Arc::new(InMemory::new()),
             Url::parse("file:///tmp/datafusion_tmp/").unwrap(),
-            "".to_string(),
         );
 
         registry
