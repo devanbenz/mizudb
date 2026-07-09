@@ -46,6 +46,7 @@ impl SchemaProvider for MizuSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        println!("Registering table {} with schema {}", name, table.schema());
         let mut tables = self.tables.write().unwrap();
         tables.insert(name, table.clone());
         Ok(Some(table))
@@ -88,6 +89,7 @@ impl CatalogProvider for MizuCatalog {
         name: &str,
         schema: Arc<dyn SchemaProvider>,
     ) -> datafusion::common::Result<Option<Arc<dyn SchemaProvider>>> {
+        println!("Registering schema {}", name);
         Ok(self
             .schemas
             .write()
