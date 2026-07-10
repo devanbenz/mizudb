@@ -16,9 +16,9 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
     DdlStatement, DmlStatement, EmptyRelation, LogicalPlan, LogicalPlanBuilder,
@@ -28,10 +28,11 @@ use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use datafusion::parquet::data_type::AsBytes;
 use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::execute_stream;
-use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
-use datafusion::sql::parser::{DFParser, Statement};
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::sql::TableReference;
+use datafusion::sql::parser::{DFParser, Statement};
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 use std::fs::exists;
 use std::io::Write;
 use std::sync::{Arc, RwLock};
@@ -83,9 +84,11 @@ impl MizuDB {
             catalog_file_table_path?,
         ));
 
-        let rt = Arc::new(RuntimeEnvBuilder::default()
-            .with_object_store_registry(object_store_registry)
-            .build()?);
+        let rt = Arc::new(
+            RuntimeEnvBuilder::default()
+                .with_object_store_registry(object_store_registry)
+                .build()?,
+        );
         let session_config =
             SessionConfig::new().with_default_catalog_and_schema(DEFAULT_CATALOG, DEFAULT_SCHEMA);
         let session_ctx = SessionContext::new_with_config_rt(session_config, rt.clone());
@@ -151,7 +154,11 @@ impl MizuDB {
         while let Some(data) = metas.next().await {
             match data {
                 Ok(data) => {
-                    let metadata = self.object_store.get_metadata(data.location.as_ref()).await.unwrap();
+                    let metadata = self
+                        .object_store
+                        .get_metadata(data.location.as_ref())
+                        .await
+                        .unwrap();
                     let metadata_bytes = Bytes::from(metadata);
                     let mut metpq = ParquetRecordBatchReader::try_new(metadata_bytes, 100).unwrap();
                     while let Some(record_batch) = metpq.next() {
@@ -177,20 +184,19 @@ impl MizuDB {
                     let schema_ref = stmt.input.schema();
 
                     let table_provider = match self.database_table_providers_cache.write() {
-                        Ok(mut table_provider) => {
-                            table_provider
-                                .entry(stmt.name.table().to_string())
-                                .or_insert(Arc::new(MizuTable::new(
-                                    schema_ref.inner().clone(),
-                                    ObjectStoreUrl::parse("file://")?,
-                                    Arc::from(ParquetSource::new(schema_ref.inner().clone())),
-                                    ListingTableUrl::parse(&format!(
-                                        "{}/{}.parquet",
-                                        self.table_path,
-                                        stmt.name.table()
-                                    ))?,
-                                ))).clone()
-                        }
+                        Ok(mut table_provider) => table_provider
+                            .entry(stmt.name.table().to_string())
+                            .or_insert(Arc::new(MizuTable::new(
+                                schema_ref.inner().clone(),
+                                ObjectStoreUrl::parse("file://")?,
+                                Arc::from(ParquetSource::new(schema_ref.inner().clone())),
+                                ListingTableUrl::parse(&format!(
+                                    "{}/{}.parquet",
+                                    self.table_path,
+                                    stmt.name.table()
+                                ))?,
+                            )))
+                            .clone(),
                         Err(err) => {
                             panic!("Error reading table provider cache: {:?}", err);
                         }
@@ -202,18 +208,18 @@ impl MizuDB {
                         lit(schema),
                         lit(stmt.name.table()),
                     ]])?
-                        .project(vec![
-                            col("column1").alias("schema_name"),
-                            col("column2").alias("table_name"),
-                        ])?
-                        .build()?;
+                    .project(vec![
+                        col("column1").alias("schema_name"),
+                        col("column2").alias("table_name"),
+                    ])?
+                    .build()?;
                     let logical_plan = LogicalPlanBuilder::insert_into(
                         catalog_input,
                         TableReference::full(DEFAULT_CATALOG, DEFAULT_SCHEMA, "mizudb_store"),
                         table_source,
                         InsertOp::Append,
                     )?
-                        .build()?;
+                    .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()
@@ -225,10 +231,8 @@ impl MizuDB {
                     for stream in streams {
                         println!("{:#?}", stream);
                     }
-                    self.ctx().register_table(
-                        stmt.name.clone(),
-                        table_provider.clone(),
-                    )?;
+                    self.ctx()
+                        .register_table(stmt.name.clone(), table_provider.clone())?;
                     Ok(Self::empty_df_ok(
                         self.ctx().clone().state(),
                         schema_ref.clone(),
@@ -263,7 +267,7 @@ impl MizuDB {
                         target,
                         InsertOp::Append,
                     )?
-                        .build()?;
+                    .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()
@@ -331,10 +335,21 @@ async fn main() -> datafusion::error::Result<()> {
             }
             continue;
         }
-        let stmt = DFParser::parse_sql(&input)?;
-        for s in stmt {
-            let df = db.exec(s).await?;
-            df.show().await?;
+        match DFParser::parse_sql(&input) {
+            Ok(statements) => {
+                for s in statements {
+                    let df = db.exec(s).await;
+                    if let Err(e) = df {
+                        println!("Execution error: {}", e);
+                    } else {
+                        df?.show().await?;
+                    }
+                }
+            }
+            Err(err) => {
+                println!("SQL parsing error: {}", err);
+                continue;
+            }
         }
     }
 
