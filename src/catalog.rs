@@ -1,9 +1,25 @@
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::object_store::ObjectMeta;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
+
+pub struct CatalogEntries {
+    schema_table_entries: Vec<MizuCatalogEntry>,
+    object_meta_entries: Vec<MizuCatalogObjectMeta>,
+}
+
+pub struct MizuCatalogObjectMeta {
+    table_name: String,
+    object_meta: ObjectMeta,
+}
+
+pub struct MizuCatalogEntry {
+    schema_name: String,
+    table_name: String,
+}
 
 // TODO: Catalog needs to implement datafusion json datatypes
 pub struct MizuSchemaProvider {

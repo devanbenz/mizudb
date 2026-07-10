@@ -4,7 +4,7 @@ use datafusion::datasource::object_store::ObjectStoreRegistry;
 use datafusion::object_store::path::Path;
 use datafusion::object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -16,8 +16,7 @@ use url::Url;
 pub struct MizuObjectStore {
     inner: Arc<t4::Store>,
     indices: Arc<RwLock<HashMap<String, Vec<usize>>>>,
-    // One parquet file per database: keyed by the first path segment
-    // (the database), so a new put for a database replaces its file.
+    /// db_file is a map of table names to ObjectMeta.
     db_file: Arc<RwLock<HashMap<String, ObjectMeta>>>,
 }
 
@@ -29,11 +28,29 @@ impl MizuObjectStore {
             dsync: true,
         };
         let store = t4::mount_with_options(path, opts).await?;
+
         Ok(Self {
             inner: Arc::new(store),
             indices: Arc::new(RwLock::new(HashMap::new())),
             db_file: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub async fn load_catalog(&self) -> Option<Vec<u8>> {
+        let catalog = self.inner.get("catalog.parquet".as_bytes()).await;
+        if let Ok(catalog) = catalog {
+            Some(catalog.to_vec())
+        } else {
+            None
+        }
+    }
+    pub async fn get_metadata(&self, key: &str) -> Option<Vec<u8>> {
+        let metadata = self.inner.get(key.as_bytes()).await;
+        if let Ok(metadata) = metadata {
+            Some(metadata.to_vec())
+        } else {
+            None
+        }
     }
 
     pub async fn get_raw_bytes(&self, key: &str) -> Vec<u8> {
@@ -62,11 +79,7 @@ impl ObjectStore for MizuObjectStore {
         _: PutOptions,
     ) -> datafusion::object_store::Result<PutResult> {
         println!("Putting {:#?} to {}", payload, location);
-        let database = location
-            .parts()
-            .next()
-            .map(|part| part.as_ref().to_string())
-            .unwrap_or_default();
+        let file = location.filename().expect("location must have a filename");
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified: chrono::Utc::now(),
@@ -77,7 +90,7 @@ impl ObjectStore for MizuObjectStore {
 
         let dblocation = {
             let db_file = self.db_file.read().unwrap();
-            let db_meta = db_file.get(&database);
+            let db_meta = db_file.get(file);
             if let Some(db_meta) = db_meta {
                 Some(db_meta.location.to_string())
             } else {
@@ -108,7 +121,10 @@ impl ObjectStore for MizuObjectStore {
                 store: "",
                 source: Box::new(err),
             })?;
-        self.db_file.write().unwrap().insert(database, meta.clone());
+        self.db_file
+            .write()
+            .unwrap()
+            .insert(file.parse().unwrap(), meta.clone());
 
         Ok(PutResult {
             e_tag: None,
@@ -129,23 +145,20 @@ impl ObjectStore for MizuObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> datafusion::object_store::Result<GetResult> {
-        let database = location
-            .parts()
-            .next()
-            .map(|part| part.as_ref().to_string())
-            .unwrap_or_default();
+        let file = location.filename().expect("location must have a filename");
         let meta = self
             .db_file
             .read()
             .unwrap()
-            .get(&database)
+            .get(file)
             .filter(|meta| meta.location == *location)
             .cloned()
             .ok_or_else(|| datafusion::object_store::Error::NotFound {
                 path: location.to_string(),
-                source: format!("no db file for database {database}").into(),
+                source: format!("no db file for table {file}").into(),
             })?;
 
+        println!("{:#?}", options);
         // Parquet reads come in as ranged gets (footer first), so the
         // requested range must be honored, not the whole object returned.
         let range = match &options.range {
