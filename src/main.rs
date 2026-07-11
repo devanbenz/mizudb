@@ -1,5 +1,4 @@
 mod catalog;
-mod data_sink;
 mod object_store;
 mod table;
 mod wal;
@@ -16,23 +15,21 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
     DdlStatement, DmlStatement, EmptyRelation, LogicalPlan, LogicalPlanBuilder,
 };
 use datafusion::object_store::ObjectStore;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
-use datafusion::parquet::data_type::AsBytes;
 use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::execute_stream;
-use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
-use datafusion::sql::TableReference;
+use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
 use datafusion::sql::parser::{DFParser, Statement};
+use datafusion::sql::TableReference;
 use futures_util::StreamExt;
-use std::collections::VecDeque;
 use std::fs::exists;
 use std::io::Write;
 use std::sync::{Arc, RwLock};
@@ -45,7 +42,6 @@ struct MizuDB {
     catalog: Arc<dyn CatalogProvider>,
     catalog_table_provider: Arc<dyn TableProvider>,
     session_ctx: SessionContext,
-    path: String,
     table_path: String,
     runtime_env: Arc<RuntimeEnv>,
     /// database_table_providers is a map of database name to table providers.
@@ -106,7 +102,6 @@ impl MizuDB {
                 catalog,
                 catalog_table_provider,
                 session_ctx,
-                path: db_path,
                 table_path,
                 database_table_providers_cache: Arc::new(Default::default()),
                 object_store,
@@ -117,7 +112,6 @@ impl MizuDB {
                 catalog,
                 catalog_table_provider,
                 session_ctx,
-                path: db_path,
                 table_path,
                 database_table_providers_cache: Arc::new(Default::default()),
                 object_store,
@@ -142,7 +136,6 @@ impl MizuDB {
             catalog,
             catalog_table_provider,
             session_ctx: SessionContext::new(),
-            path: "".to_string(),
             table_path: "".to_string(),
             database_table_providers_cache: Arc::new(Default::default()),
             object_store: Arc::new(MizuObjectStore::new("").await.unwrap()),
@@ -208,18 +201,18 @@ impl MizuDB {
                         lit(schema),
                         lit(stmt.name.table()),
                     ]])?
-                    .project(vec![
-                        col("column1").alias("schema_name"),
-                        col("column2").alias("table_name"),
-                    ])?
-                    .build()?;
+                        .project(vec![
+                            col("column1").alias("schema_name"),
+                            col("column2").alias("table_name"),
+                        ])?
+                        .build()?;
                     let logical_plan = LogicalPlanBuilder::insert_into(
                         catalog_input,
                         TableReference::full(DEFAULT_CATALOG, DEFAULT_SCHEMA, "mizudb_store"),
                         table_source,
                         InsertOp::Append,
                     )?
-                    .build()?;
+                        .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()
@@ -267,7 +260,7 @@ impl MizuDB {
                         target,
                         InsertOp::Append,
                     )?
-                    .build()?;
+                        .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()

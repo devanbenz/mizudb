@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use bytes::Bytes;
+use datafusion::arrow::compute::concat_batches;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::object_store::ObjectStoreRegistry;
 use datafusion::object_store::path::Path;
@@ -6,6 +8,10 @@ use datafusion::object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use datafusion::parquet::arrow::arrow_reader::{
+    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+};
+use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -44,6 +50,7 @@ impl MizuObjectStore {
             None
         }
     }
+
     pub async fn get_metadata(&self, key: &str) -> Option<Vec<u8>> {
         let metadata = self.inner.get(key.as_bytes()).await;
         if let Ok(metadata) = metadata {
@@ -55,6 +62,36 @@ impl MizuObjectStore {
 
     pub async fn get_raw_bytes(&self, key: &str) -> Vec<u8> {
         self.inner.get(key.as_ref()).await.unwrap().to_vec()
+    }
+
+    // TODO: This is not scalable at all, I'm sure there's a better way to do this.
+    async fn merge(&self, input_data: PutPayload, key: &str) -> t4::Result<Bytes> {
+        let mut buf: Vec<u8> = Vec::new();
+        let existing_data = self.inner.get(key.as_bytes()).await?;
+        let existing_data = Bytes::from(existing_data);
+        let existing_data_reader =
+            ParquetRecordBatchReaderBuilder::try_new(existing_data).expect("parquet reader");
+        let existing_schema = existing_data_reader.schema().clone();
+        let existing_data_reader = existing_data_reader.build().expect("parquet reader");
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, existing_schema.clone(), None).expect("arrow writer");
+        let mut batches = existing_data_reader
+            .map(|batch| batch.expect("batch"))
+            .collect::<Vec<_>>();
+
+        for data in input_data.into_iter() {
+            let new_data_reader =
+                ParquetRecordBatchReader::try_new(data, 100).expect("parquet reader");
+            for batch in new_data_reader {
+                batches.push(batch.expect("batch"));
+            }
+        }
+
+        let batches = concat_batches(&existing_schema, &batches).expect("concat batches");
+        writer.write(&batches).expect("write");
+
+        writer.close().expect("close writer");
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -78,9 +115,8 @@ impl ObjectStore for MizuObjectStore {
         payload: PutPayload,
         _: PutOptions,
     ) -> datafusion::object_store::Result<PutResult> {
-        println!("Putting {:#?} to {}", payload, location);
         let file = location.filename().expect("location must have a filename");
-        let meta = ObjectMeta {
+        let mut meta = ObjectMeta {
             location: location.clone(),
             last_modified: chrono::Utc::now(),
             size: payload.content_length() as u64,
@@ -98,24 +134,25 @@ impl ObjectStore for MizuObjectStore {
             }
         };
 
-        if let Some(dblocation) = dblocation {
-            self.inner
-                .get(dblocation.as_bytes())
-                .await
-                .map(|data| {
-                    println!("Existing data: {:#?}", data);
-                })
-                .map_err(|err| datafusion::object_store::Error::Generic {
+        let merged_data = {
+            if let Some(dblocation) = &dblocation {
+                let merged = self.merge(payload, &dblocation).await.map_err(|err| datafusion::object_store::Error::Generic {
                     store: "",
                     source: Box::new(err),
                 })?;
-        }
+                self.inner.remove(dblocation.as_bytes()).await.unwrap();
+                self.inner.sync().await.unwrap();
+                meta.size = merged.len() as u64;
+                merged
+            } else {
+                payload.into_iter().next().unwrap()
+            }
+        };
 
         // Write the payload as one contiguous value: chunk-wise puts under
         // the same key would each overwrite the previous chunk.
-        let data = bytes::Bytes::from(payload);
         self.inner
-            .put(location.to_string(), data.to_vec())
+            .put(location.to_string(), merged_data.to_vec())
             .await
             .map_err(|err| datafusion::object_store::Error::Generic {
                 store: "",
@@ -134,8 +171,8 @@ impl ObjectStore for MizuObjectStore {
 
     async fn put_multipart_opts(
         &self,
-        location: &Path,
-        opts: PutMultipartOptions,
+        _location: &Path,
+        _opts: PutMultipartOptions,
     ) -> datafusion::object_store::Result<Box<dyn MultipartUpload>> {
         todo!()
     }
@@ -158,9 +195,7 @@ impl ObjectStore for MizuObjectStore {
                 source: format!("no db file for table {file}").into(),
             })?;
 
-        println!("{:#?}", options);
-        // Parquet reads come in as ranged gets (footer first), so the
-        // requested range must be honored, not the whole object returned.
+        // Read parquet footer
         let range = match &options.range {
             Some(range) => range.as_range(meta.size).map_err(|err| {
                 datafusion::object_store::Error::Generic {
@@ -196,7 +231,7 @@ impl ObjectStore for MizuObjectStore {
 
     fn delete_stream(
         &self,
-        locations: futures_core::stream::BoxStream<'static, datafusion::object_store::Result<Path>>,
+        _locations: futures_core::stream::BoxStream<'static, datafusion::object_store::Result<Path>>,
     ) -> futures_core::stream::BoxStream<'static, datafusion::object_store::Result<Path>> {
         todo!()
     }
@@ -223,16 +258,16 @@ impl ObjectStore for MizuObjectStore {
 
     async fn list_with_delimiter(
         &self,
-        prefix: Option<&Path>,
+        _prefix: Option<&Path>,
     ) -> datafusion::object_store::Result<ListResult> {
         todo!()
     }
 
     async fn copy_opts(
         &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
     ) -> datafusion::object_store::Result<()> {
         todo!()
     }

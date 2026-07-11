@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 pub struct MizuTable {
     schema: SchemaRef,
-    format: Arc<dyn FileFormat>,
     file_source: Arc<dyn FileSource>,
     object_store_url: ObjectStoreUrl,
     table_paths: Vec<ListingTableUrl>,
@@ -36,7 +35,6 @@ impl MizuTable {
         let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::new());
         MizuTable {
             schema,
-            format: Arc::clone(&format),
             file_source,
             object_store_url,
             table_paths: vec![table_path],
@@ -112,6 +110,7 @@ impl TableProvider for MizuTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        println!("input: {:#?}", input);
         // Check that the schema of the plan matches the schema of this table.
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
