@@ -16,7 +16,7 @@ use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
@@ -43,7 +43,6 @@ struct MizuDB {
     catalog_table_provider: Arc<dyn TableProvider>,
     session_ctx: SessionContext,
     table_path: String,
-    runtime_env: Arc<RuntimeEnv>,
     /// database_table_providers is a map of database name to table providers.
     /// The key is the name of the database, and the value is the table provider.
     /// This ensures we have a single file for each database.
@@ -51,6 +50,7 @@ struct MizuDB {
     object_store: Arc<MizuObjectStore>,
 }
 
+// TODO: Refactoring time!
 impl MizuDB {
     async fn new(db_path: String) -> datafusion::error::Result<Self> {
         let path = format!("{}/mizudb_store", db_path);
@@ -98,7 +98,6 @@ impl MizuDB {
         if exists(path.as_str())? {
             // Self::load_db(catalog).await
             Ok(Self {
-                runtime_env: Arc::clone(&rt),
                 catalog,
                 catalog_table_provider,
                 session_ctx,
@@ -108,7 +107,6 @@ impl MizuDB {
             })
         } else {
             Ok(Self {
-                runtime_env: Arc::clone(&rt),
                 catalog,
                 catalog_table_provider,
                 session_ctx,
@@ -132,7 +130,6 @@ impl MizuDB {
         catalog_table_provider: Arc<dyn TableProvider>,
     ) -> datafusion::error::Result<Self> {
         Ok(Self {
-            runtime_env: Arc::new(RuntimeEnv::default()),
             catalog,
             catalog_table_provider,
             session_ctx: SessionContext::new(),
