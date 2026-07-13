@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::object_store::ObjectStoreRegistry;
 use datafusion::object_store::path::Path;
@@ -8,10 +9,10 @@ use datafusion::object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
-use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -57,6 +58,15 @@ impl MizuObjectStore {
             Some(metadata.to_vec())
         } else {
             None
+        }
+    }
+
+    pub fn get_db_cache(&self) {
+        if self.db_file.read().unwrap().is_empty() {
+            println!("No DB cache in file");
+        }
+        for (k, v) in self.db_file.read().unwrap().iter() {
+            println!("key {}, value {:#?}", k, v);
         }
     }
 
@@ -128,7 +138,7 @@ impl ObjectStore for MizuObjectStore {
             let db_file = self.db_file.read().unwrap();
             let db_meta = db_file.get(file);
             if let Some(db_meta) = db_meta {
-                Some(db_meta.location.to_string())
+                db_meta.location.filename().map(|f| f.to_string())
             } else {
                 None
             }
@@ -136,9 +146,11 @@ impl ObjectStore for MizuObjectStore {
 
         let merged_data = {
             if let Some(dblocation) = &dblocation {
-                let merged = self.merge(payload, &dblocation).await.map_err(|err| datafusion::object_store::Error::Generic {
-                    store: "",
-                    source: Box::new(err),
+                let merged = self.merge(payload, &dblocation).await.map_err(|err| {
+                    datafusion::object_store::Error::Generic {
+                        store: "",
+                        source: Box::new(err),
+                    }
                 })?;
                 self.inner.remove(dblocation.as_bytes()).await.unwrap();
                 self.inner.sync().await.unwrap();
@@ -152,7 +164,7 @@ impl ObjectStore for MizuObjectStore {
         // Write the payload as one contiguous value: chunk-wise puts under
         // the same key would each overwrite the previous chunk.
         self.inner
-            .put(location.to_string(), merged_data.to_vec())
+            .put(file, merged_data.to_vec())
             .await
             .map_err(|err| datafusion::object_store::Error::Generic {
                 store: "",
@@ -183,6 +195,9 @@ impl ObjectStore for MizuObjectStore {
         options: GetOptions,
     ) -> datafusion::object_store::Result<GetResult> {
         let file = location.filename().expect("location must have a filename");
+        for (v, o) in self.db_file.read().unwrap().iter() {
+            println!("{:#?} - {:#?}", v, o);
+        }
         let meta = self
             .db_file
             .read()
@@ -208,11 +223,7 @@ impl ObjectStore for MizuObjectStore {
 
         let data = self
             .inner
-            .get_range(
-                location.to_string().as_bytes(),
-                range.start,
-                range.end - range.start,
-            )
+            .get_range(file.as_bytes(), range.start, range.end - range.start)
             .await
             .map_err(|err| datafusion::object_store::Error::Generic {
                 store: "",
@@ -231,7 +242,10 @@ impl ObjectStore for MizuObjectStore {
 
     fn delete_stream(
         &self,
-        _locations: futures_core::stream::BoxStream<'static, datafusion::object_store::Result<Path>>,
+        _locations: futures_core::stream::BoxStream<
+            'static,
+            datafusion::object_store::Result<Path>,
+        >,
     ) -> futures_core::stream::BoxStream<'static, datafusion::object_store::Result<Path>> {
         todo!()
     }

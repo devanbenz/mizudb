@@ -7,6 +7,7 @@ use crate::catalog::{MizuCatalog, MizuSchemaProvider};
 use crate::object_store::{MizuObjectStore, MizuObjectStoreRegistry};
 use crate::table::MizuTable;
 use bytes::Bytes;
+use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::CatalogProvider;
 use datafusion::common::{DFSchema, HashMap};
@@ -15,9 +16,9 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
     DdlStatement, DmlStatement, EmptyRelation, LogicalPlan, LogicalPlanBuilder,
@@ -26,13 +27,15 @@ use datafusion::object_store::ObjectStore;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::execute_stream;
-use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
-use datafusion::sql::parser::{DFParser, Statement};
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::sql::TableReference;
+use datafusion::sql::parser::{DFParser, Statement};
 use futures_util::StreamExt;
+use json::{JsonValue, object};
 use std::fs::exists;
 use std::io::Write;
 use std::sync::{Arc, RwLock};
+use tokio::task::id;
 use url::Url;
 
 const DEFAULT_SCHEMA: &str = "public";
@@ -69,6 +72,7 @@ impl MizuDB {
         let catalog_schema = SchemaRef::new(Schema::new(vec![
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
+            Field::new("schema", DataType::Utf8, false),
         ]));
         let catalog_file_source = Arc::new(ParquetSource::new(catalog_schema.clone()));
         let catalog_file_table_path =
@@ -97,14 +101,72 @@ impl MizuDB {
         // TODO: Check if db file exists, if not create it, if it does load it in to the catalog.
         if exists(path.as_str())? {
             // Self::load_db(catalog).await
-            Ok(Self {
-                catalog,
+            let db = Self {
+                catalog: catalog.clone(),
                 catalog_table_provider,
-                session_ctx,
+                session_ctx: session_ctx.clone(),
                 table_path,
                 database_table_providers_cache: Arc::new(Default::default()),
-                object_store,
-            })
+                object_store: object_store.clone(),
+            };
+
+            if let Some(cat) = object_store.load_catalog().await {
+                let reader = ParquetRecordBatchReader::try_new(Bytes::from(cat), 10)
+                    .expect("ParquetRecordBatchReader");
+
+                for value in reader {
+                    let value = value?;
+                    let schema_name = value
+                        .column(0)
+                        .clone()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .clone();
+                    let table_name = value
+                        .column(1)
+                        .clone()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .clone();
+                    let schema = value
+                        .column(2)
+                        .clone()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .clone();
+
+                    for idx in 0..schema_name.len() {
+                        catalog.register_schema(
+                            schema_name.value(idx),
+                            Arc::new(MizuSchemaProvider::new()),
+                        )?;
+                        let schema_json = json::from(schema.value(idx));
+                        let mut schema_fields = vec![];
+                        for (key, val) in schema_json.entries() {
+                            let dt: DataType = val
+                                .as_str()
+                                .expect("")
+                                .parse()
+                                .expect("Could not parse datatype");
+                            schema_fields.push(Field::new(key, dt, false));
+                        }
+                        let schema = SchemaRef::new(Schema::new(schema_fields));
+                        let table_provider = db.get_table_provider(table_name.value(idx), &schema);
+                        let table_ref = TableReference::full(
+                            DEFAULT_CATALOG,
+                            schema_name.value(idx),
+                            table_name.value(idx),
+                        );
+                        session_ctx.register_table(table_ref, table_provider.clone())?;
+                    }
+                }
+            }
+            object_store.get_db_cache();
+
+            Ok(db)
         } else {
             Ok(Self {
                 catalog,
@@ -164,52 +226,67 @@ impl MizuDB {
         vec![]
     }
 
+    fn get_table_provider(
+        &self,
+        table_name: &str,
+        schema_ref: &SchemaRef,
+    ) -> Arc<dyn TableProvider> {
+        match self.database_table_providers_cache.write() {
+            Ok(mut table_provider) => table_provider
+                .entry(table_name.to_string())
+                .or_insert(Arc::new(MizuTable::new(
+                    schema_ref.clone(),
+                    ObjectStoreUrl::parse("file://").expect("Parsing object store url"),
+                    Arc::from(ParquetSource::new(schema_ref.clone())),
+                    ListingTableUrl::parse(&format!("{}/{}.parquet", self.table_path, table_name))
+                        .expect("ParquetTable URL"),
+                )))
+                .clone(),
+            Err(err) => {
+                panic!("Error reading table provider cache: {:?}", err);
+            }
+        }
+    }
+
     // TODO: Refactor exec
     // - Table and Schema creation should be less verbose and in private methods
     async fn exec(&self, stmt: Statement) -> datafusion::error::Result<DataFrame> {
+        self.object_store.get_db_cache();
         match self.ctx().state().statement_to_plan(stmt).await? {
             LogicalPlan::Ddl(ddl) => match ddl {
                 DdlStatement::CreateMemoryTable(stmt) => {
                     let schema = stmt.name.schema().or_else(|| Some(DEFAULT_SCHEMA)).unwrap();
                     let schema_ref = stmt.input.schema();
+                    let mut data = JsonValue::new_object();
+                    for (_, field) in schema_ref.iter() {
+                        let field_str = field.name();
+                        let data_type = field.data_type().to_string();
+                        data[field_str] = data_type.into();
+                    }
 
-                    let table_provider = match self.database_table_providers_cache.write() {
-                        Ok(mut table_provider) => table_provider
-                            .entry(stmt.name.table().to_string())
-                            .or_insert(Arc::new(MizuTable::new(
-                                schema_ref.inner().clone(),
-                                ObjectStoreUrl::parse("file://")?,
-                                Arc::from(ParquetSource::new(schema_ref.inner().clone())),
-                                ListingTableUrl::parse(&format!(
-                                    "{}/{}.parquet",
-                                    self.table_path,
-                                    stmt.name.table()
-                                ))?,
-                            )))
-                            .clone(),
-                        Err(err) => {
-                            panic!("Error reading table provider cache: {:?}", err);
-                        }
-                    };
+                    let table_provider =
+                        self.get_table_provider(&schema, schema_ref.as_ref().as_ref());
 
                     let table_source =
                         Arc::new(DefaultTableSource::new(self.catalog_table_provider.clone()));
                     let catalog_input = LogicalPlanBuilder::values(vec![vec![
                         lit(schema),
                         lit(stmt.name.table()),
+                        lit(data.to_string()),
                     ]])?
-                        .project(vec![
-                            col("column1").alias("schema_name"),
-                            col("column2").alias("table_name"),
-                        ])?
-                        .build()?;
+                    .project(vec![
+                        col("column1").alias("schema_name"),
+                        col("column2").alias("table_name"),
+                        col("column3").alias("schema"),
+                    ])?
+                    .build()?;
                     let logical_plan = LogicalPlanBuilder::insert_into(
                         catalog_input,
                         TableReference::full(DEFAULT_CATALOG, DEFAULT_SCHEMA, "mizudb_store"),
                         table_source,
                         InsertOp::Append,
                     )?
-                        .build()?;
+                    .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()
@@ -217,10 +294,7 @@ impl MizuDB {
                         .await?;
                     let stream =
                         execute_stream(physical_plan.clone(), self.ctx().task_ctx().clone())?;
-                    let streams = collect(stream).await?;
-                    for stream in streams {
-                        println!("{:#?}", stream);
-                    }
+                    let _ = collect(stream).await?;
                     self.ctx()
                         .register_table(stmt.name.clone(), table_provider.clone())?;
                     Ok(Self::empty_df_ok(
@@ -234,7 +308,6 @@ impl MizuDB {
                     let schema_name = parsed.table();
                     let provider = Arc::new(MizuSchemaProvider::new());
                     self.catalog().register_schema(schema_name, provider)?;
-                    println!("Schemas {:?}", self.catalog.clone().schema_names());
                     Ok(Self::empty_df_ok(
                         self.ctx().clone().state(),
                         stmt.schema.clone(),
@@ -257,7 +330,7 @@ impl MizuDB {
                         target,
                         InsertOp::Append,
                     )?
-                        .build()?;
+                    .build()?;
                     let physical_plan = self
                         .ctx()
                         .state()
@@ -265,10 +338,7 @@ impl MizuDB {
                         .await?;
                     let stream =
                         execute_stream(physical_plan.clone(), self.ctx().task_ctx().clone())?;
-                    let streams = collect(stream).await?;
-                    for stream in streams {
-                        println!("{:#?}", stream);
-                    }
+                    let _ = collect(stream).await?;
                     Ok(Self::empty_df_ok(
                         self.ctx().clone().state(),
                         output_schema.clone(),

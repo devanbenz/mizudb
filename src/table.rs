@@ -1,18 +1,20 @@
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{plan_err, SchemaExt};
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
-use datafusion::datasource::physical_plan::{FileGroup, FileOutputMode, FileScanConfigBuilder, FileSinkConfig, FileSource};
+use datafusion::common::{SchemaExt, plan_err};
 use datafusion::datasource::TableType;
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileOutputMode, FileScanConfigBuilder, FileSinkConfig, FileSource,
+};
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::execution_props::ExecutionProps;
-use datafusion::logical_expr::Expr;
 use datafusion::object_store::ObjectStoreExt;
-use datafusion::physical_expr::{create_lex_ordering, LexOrdering};
+use datafusion::physical_expr::{LexOrdering, create_lex_ordering};
 use datafusion::physical_plan::ExecutionPlan;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -93,7 +95,6 @@ impl TableProvider for MizuTable {
         let store = state.runtime_env().object_store(&self.table_paths()[0])?;
         let meta = store.head(&self.table_paths()[0].prefix()).await?;
         let partitioned_file = PartitionedFile::from(meta);
-        println!("meta: {:#?}", partitioned_file);
         let file_scan_config =
             FileScanConfigBuilder::new(self.object_store_url.clone(), self.file_source.clone())
                 .with_projection_indices(projection.cloned())?
@@ -101,7 +102,11 @@ impl TableProvider for MizuTable {
                 .with_file(partitioned_file)
                 .build();
 
-        Ok(self.options().format.create_physical_plan(state, file_scan_config).await?)
+        Ok(self
+            .options()
+            .format
+            .create_physical_plan(state, file_scan_config)
+            .await?)
     }
 
     async fn insert_into(
@@ -110,7 +115,6 @@ impl TableProvider for MizuTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        println!("input: {:#?}", input);
         // Check that the schema of the plan matches the schema of this table.
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
@@ -120,9 +124,9 @@ impl TableProvider for MizuTable {
         // Inverted check: we now require the path to point at exactly one file.
         if table_path.is_collection() {
             return plan_err!(
-            "Inserting requires a table backed by a single file, but the URL is a \
+                "Inserting requires a table backed by a single file, but the URL is a \
              collection (it ends with a trailing `/`). Point the table at one file instead."
-        );
+            );
         }
 
         // No partition listing needed for a single file. If the file already
@@ -134,8 +138,7 @@ impl TableProvider for MizuTable {
             Err(_) => FileGroup::default(),
         };
 
-        let keep_partition_by_columns =
-            state.config_options().execution.keep_partition_by_columns;
+        let keep_partition_by_columns = state.config_options().execution.keep_partition_by_columns;
 
         // Sink related options, apart from format
         let config = FileSinkConfig {

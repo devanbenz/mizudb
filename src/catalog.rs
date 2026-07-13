@@ -83,6 +83,11 @@ impl MizuCatalog {
             schemas: RwLock::new(HashMap::new()),
         }
     }
+
+    pub(crate) async fn get_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let schemas = self.schemas.read().unwrap();
+        schemas.get(name).cloned()
+    }
 }
 
 impl Debug for MizuCatalog {
@@ -105,7 +110,6 @@ impl CatalogProvider for MizuCatalog {
         name: &str,
         schema: Arc<dyn SchemaProvider>,
     ) -> datafusion::common::Result<Option<Arc<dyn SchemaProvider>>> {
-        println!("Registering schema {}", name);
         Ok(self
             .schemas
             .write()
