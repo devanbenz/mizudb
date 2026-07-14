@@ -14,3 +14,4 @@ t4 = "0.1.7"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 json = "0.12.4"
+wincode = { version = "0.5.5", features = ["derive"] }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::TimeZone;
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::object_store::ObjectStoreRegistry;
 use datafusion::object_store::path::Path;
@@ -9,22 +9,41 @@ use datafusion::object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
+use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::{Arc, RwLock};
 use t4::MountOptions;
 use url::Url;
+use wincode::{SchemaRead, SchemaWrite};
 
-pub struct MizuObjectStore {
-    inner: Arc<t4::Store>,
-    indices: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+const METADATA_CACHE_FILE: &str = "metadata_cache.bin";
+
+#[derive(SchemaRead, SchemaWrite)]
+struct MizuObjectStoreSerializerInner {
+    key: String,
+    location: String,
+    last_modified: i64,
+    size: u64,
+}
+
+#[derive(SchemaRead, SchemaWrite)]
+struct MizuObjectStoreSerializer {
+    inner: Vec<MizuObjectStoreSerializerInner>,
+}
+
+struct MizuObjectStoreInner {
     /// db_file is a map of table names to ObjectMeta.
     db_file: Arc<RwLock<HashMap<String, ObjectMeta>>>,
+}
+
+pub struct MizuObjectStore {
+    store: Arc<t4::Store>,
+    inner: MizuObjectStoreInner,
 }
 
 impl MizuObjectStore {
@@ -37,14 +56,21 @@ impl MizuObjectStore {
         let store = t4::mount_with_options(path, opts).await?;
 
         Ok(Self {
-            inner: Arc::new(store),
-            indices: Arc::new(RwLock::new(HashMap::new())),
-            db_file: Arc::new(RwLock::new(HashMap::new())),
+            store: Arc::new(store),
+            inner: MizuObjectStoreInner {
+                db_file: Arc::new(RwLock::new(HashMap::new())),
+            },
         })
     }
 
+    pub async fn load_meta(&self) {
+        if let Ok(metadata_cache) = self.store.get(METADATA_CACHE_FILE.as_bytes()).await {
+            self.deserialize_meta_cache(&metadata_cache);
+        }
+    }
+
     pub async fn load_catalog(&self) -> Option<Vec<u8>> {
-        let catalog = self.inner.get("catalog.parquet".as_bytes()).await;
+        let catalog = self.store.get("catalog.parquet".as_bytes()).await;
         if let Ok(catalog) = catalog {
             Some(catalog.to_vec())
         } else {
@@ -53,7 +79,7 @@ impl MizuObjectStore {
     }
 
     pub async fn get_metadata(&self, key: &str) -> Option<Vec<u8>> {
-        let metadata = self.inner.get(key.as_bytes()).await;
+        let metadata = self.store.get(key.as_bytes()).await;
         if let Ok(metadata) = metadata {
             Some(metadata.to_vec())
         } else {
@@ -62,22 +88,53 @@ impl MizuObjectStore {
     }
 
     pub fn get_db_cache(&self) {
-        if self.db_file.read().unwrap().is_empty() {
+        if self.inner.db_file.read().unwrap().is_empty() {
             println!("No DB cache in file");
         }
-        for (k, v) in self.db_file.read().unwrap().iter() {
+        for (k, v) in self.inner.db_file.read().unwrap().iter() {
             println!("key {}, value {:#?}", k, v);
         }
     }
 
     pub async fn get_raw_bytes(&self, key: &str) -> Vec<u8> {
-        self.inner.get(key.as_ref()).await.unwrap().to_vec()
+        self.store.get(key.as_ref()).await.unwrap().to_vec()
+    }
+
+    fn serialize_meta_cache(&self) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for (k, v) in self.inner.db_file.read().unwrap().iter() {
+            let v = MizuObjectStoreSerializerInner {
+                key: k.to_string(),
+                location: v.location.to_string(),
+                last_modified: v.last_modified.timestamp(),
+                size: v.size,
+            };
+            inner.push(v);
+        }
+
+        let outer = MizuObjectStoreSerializer { inner };
+        let serialized = wincode::serialize(&outer).unwrap();
+        serialized
+    }
+
+    fn deserialize_meta_cache(&self, serialized: &[u8]) {
+        let outer: MizuObjectStoreSerializer = wincode::deserialize(serialized).unwrap();
+        for v in outer.inner {
+            let meta = ObjectMeta {
+                location: Path::parse(&v.location).unwrap(),
+                last_modified: chrono::Utc.timestamp_opt(v.last_modified, 0).unwrap(),
+                size: v.size,
+                e_tag: None,
+                version: None,
+            };
+            self.inner.db_file.write().unwrap().insert(v.key, meta);
+        }
     }
 
     // TODO: This is not scalable at all, I'm sure there's a better way to do this.
     async fn merge(&self, input_data: PutPayload, key: &str) -> t4::Result<Bytes> {
         let mut buf: Vec<u8> = Vec::new();
-        let existing_data = self.inner.get(key.as_bytes()).await?;
+        let existing_data = self.store.get(key.as_bytes()).await?;
         let existing_data = Bytes::from(existing_data);
         let existing_data_reader =
             ParquetRecordBatchReaderBuilder::try_new(existing_data).expect("parquet reader");
@@ -107,7 +164,7 @@ impl MizuObjectStore {
 
 impl Debug for MizuObjectStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MizuObjectStore {{ inner: {:?} }}", self.inner)
+        write!(f, "MizuObjectStore {{ inner: {:?} }}", self.store)
     }
 }
 
@@ -135,7 +192,7 @@ impl ObjectStore for MizuObjectStore {
         };
 
         let dblocation = {
-            let db_file = self.db_file.read().unwrap();
+            let db_file = self.inner.db_file.read().unwrap();
             let db_meta = db_file.get(file);
             if let Some(db_meta) = db_meta {
                 db_meta.location.filename().map(|f| f.to_string())
@@ -152,8 +209,8 @@ impl ObjectStore for MizuObjectStore {
                         source: Box::new(err),
                     }
                 })?;
-                self.inner.remove(dblocation.as_bytes()).await.unwrap();
-                self.inner.sync().await.unwrap();
+                self.store.remove(dblocation.as_bytes()).await.unwrap();
+                self.store.sync().await.unwrap();
                 meta.size = merged.len() as u64;
                 merged
             } else {
@@ -163,17 +220,20 @@ impl ObjectStore for MizuObjectStore {
 
         // Write the payload as one contiguous value: chunk-wise puts under
         // the same key would each overwrite the previous chunk.
-        self.inner
+        self.store
             .put(file, merged_data.to_vec())
             .await
             .map_err(|err| datafusion::object_store::Error::Generic {
                 store: "",
                 source: Box::new(err),
             })?;
-        self.db_file
+        self.inner.db_file
             .write()
             .unwrap()
             .insert(file.parse().unwrap(), meta.clone());
+
+        self.store.put(METADATA_CACHE_FILE, self.serialize_meta_cache()).await.unwrap();
+        self.store.sync().await.unwrap();
 
         Ok(PutResult {
             e_tag: None,
@@ -195,10 +255,8 @@ impl ObjectStore for MizuObjectStore {
         options: GetOptions,
     ) -> datafusion::object_store::Result<GetResult> {
         let file = location.filename().expect("location must have a filename");
-        for (v, o) in self.db_file.read().unwrap().iter() {
-            println!("{:#?} - {:#?}", v, o);
-        }
         let meta = self
+            .inner
             .db_file
             .read()
             .unwrap()
@@ -222,7 +280,7 @@ impl ObjectStore for MizuObjectStore {
         };
 
         let data = self
-            .inner
+            .store
             .get_range(file.as_bytes(), range.start, range.end - range.start)
             .await
             .map_err(|err| datafusion::object_store::Error::Generic {
@@ -256,6 +314,7 @@ impl ObjectStore for MizuObjectStore {
     ) -> futures_core::stream::BoxStream<'static, datafusion::object_store::Result<ObjectMeta>>
     {
         let metas: Vec<_> = self
+            .inner
             .db_file
             .read()
             .unwrap()
