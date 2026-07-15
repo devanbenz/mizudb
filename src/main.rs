@@ -2,6 +2,8 @@ mod catalog;
 mod object_store;
 mod table;
 mod wal;
+mod data_sink;
+mod disk_manager;
 
 use crate::catalog::{MizuCatalog, MizuSchemaProvider};
 use crate::object_store::{MizuObjectStore, MizuObjectStoreRegistry};
