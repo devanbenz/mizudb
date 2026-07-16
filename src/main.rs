@@ -352,6 +352,7 @@ impl MizuDB {
                         InsertOp::Append,
                     )?
                         .build()?;
+
                     let physical_plan = self
                         .ctx()
                         .state()
