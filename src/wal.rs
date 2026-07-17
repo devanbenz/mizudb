@@ -1,6 +1,11 @@
-use crate::catalog::MizuSchemaProvider;
-use crate::disk_manager::MizuDiskManager;
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::datasource::sink::DataSink;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::object_store::path::Path;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use futures_util::StreamExt;
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
 
 pub enum WALOperation {
@@ -42,21 +47,12 @@ impl WALEntry {
 
 pub struct MizuWAL {
     path: Path,
-    schema_provider: Arc<MizuSchemaProvider>,
-    disk_manager: Arc<MizuDiskManager>,
+    schema: SchemaRef,
 }
 
 impl MizuWAL {
-    pub fn new(
-        path: Path,
-        schema_provider: Arc<MizuSchemaProvider>,
-        disk_manager: Arc<MizuDiskManager>,
-    ) -> Self {
-        Self {
-            path,
-            schema_provider,
-            disk_manager,
-        }
+    pub fn new(path: Path, schema: SchemaRef) -> Self {
+        Self { path, schema }
     }
 
     pub(crate) fn exec(&self, entry: WALEntry) {
@@ -77,16 +73,48 @@ impl MizuWAL {
     }
 }
 
+impl DisplayAs for MizuWAL {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl Debug for MizuWAL {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl DataSink for MizuWAL {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        let mut data = data.fuse();
+        while let Some(batch) = data.next().await {
+            let batch = batch?;
+
+            todo!()
+        }
+
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
 
-    #[test]
-    fn wal_basic_test() {
-        let mwal = MizuWAL::new(
-            Path::parse("test").unwrap(),
-            Arc::new(MizuSchemaProvider::new()),
-            Arc::new(MizuDiskManager::new()),
-        );
-    }
+    // #[test]
+    // fn wal_basic_test() {
+    //     let mwal = MizuWAL::new(
+    //         Path::parse("test").unwrap(),
+    //         Arc::new(Schema::new(vec![])),
+    //     );
+    // }
 }

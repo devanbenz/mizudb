@@ -1,20 +1,27 @@
+use crate::data_sink::MizuDataSink;
+use crate::disk_manager::{MizuDiskManager, MizuDiskManagerCacheEntry};
+use crate::wal::MizuWAL;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{SchemaExt, plan_err};
-use datafusion::datasource::TableType;
-use datafusion::datasource::file_format::FileFormat;
+use datafusion::common::{plan_err, SchemaExt};
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
+use datafusion::datasource::physical_plan::parquet::ParquetSink;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileOutputMode, FileScanConfigBuilder, FileSinkConfig, FileSource,
 };
+use datafusion::datasource::sink::DataSinkExec;
+use datafusion::datasource::TableType;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::execution_props::ExecutionProps;
+use datafusion::logical_expr::Expr;
+use datafusion::object_store::path::Path;
 use datafusion::object_store::ObjectStoreExt;
-use datafusion::physical_expr::{LexOrdering, create_lex_ordering};
+use datafusion::physical_expr::{create_lex_ordering, LexOrdering};
 use datafusion::physical_plan::ExecutionPlan;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -24,6 +31,7 @@ pub struct MizuTable {
     file_source: Arc<dyn FileSource>,
     object_store_url: ObjectStoreUrl,
     table_paths: Vec<ListingTableUrl>,
+    disk_manager: Arc<MizuDiskManager>,
     options: ListingOptions,
 }
 
@@ -33,6 +41,7 @@ impl MizuTable {
         object_store_url: ObjectStoreUrl,
         file_source: Arc<dyn FileSource>,
         table_path: ListingTableUrl,
+        disk_manager: Arc<MizuDiskManager>,
     ) -> Self {
         let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::new());
         MizuTable {
@@ -41,6 +50,7 @@ impl MizuTable {
             object_store_url,
             table_paths: vec![table_path],
             options: ListingOptions::new(format),
+            disk_manager,
         }
     }
 
@@ -115,13 +125,11 @@ impl TableProvider for MizuTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        // Check that the schema of the plan matches the schema of this table.
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
 
         let table_path = &self.table_paths()[0];
 
-        // Inverted check: we now require the path to point at exactly one file.
         if table_path.is_collection() {
             return plan_err!(
                 "Inserting requires a table backed by a single file, but the URL is a \
@@ -129,10 +137,8 @@ impl TableProvider for MizuTable {
             );
         }
 
-        // No partition listing needed for a single file. If the file already
-        // exists, include it in the file group so InsertOp::Overwrite knows
-        // what it is replacing; otherwise start with an empty group.
         let store = state.runtime_env().object_store(table_path)?;
+        // This is a single file table, so we can just use the head() method to get the metadata.
         let file_group = match store.head(table_path.prefix()).await {
             Ok(meta) => vec![PartitionedFile::from(meta)].into(),
             Err(_) => FileGroup::default(),
@@ -140,31 +146,51 @@ impl TableProvider for MizuTable {
 
         let keep_partition_by_columns = state.config_options().execution.keep_partition_by_columns;
 
-        // Sink related options, apart from format
+        // TODO: Check if ParquetSink and WAL are in cache, if not create them.
         let config = FileSinkConfig {
             original_url: String::default(),
             object_store_url: table_path.object_store(),
             table_paths: self.table_paths().clone(),
             file_group,
             output_schema: self.schema(),
-            // Hive-style partitioning is meaningless for a single output file
             table_partition_cols: vec![],
             insert_op,
             keep_partition_by_columns,
             file_extension: self.options().format.get_ext(),
-            // Force all output rows into one file rather than letting the
-            // sink demux into multiple files
             file_output_mode: FileOutputMode::SingleFile,
         };
 
-        // For writes, we only use user-specified ordering (no file groups to derive from)
         let orderings = self.try_create_output_ordering(state.execution_props(), &[])?;
-        // It is sufficient to pass only one of the equivalent orderings:
         let order_requirements = orderings.into_iter().next().map(Into::into);
 
-        self.options()
-            .format
-            .create_writer_physical_plan(input, state, config, order_requirements)
-            .await
+        if let Some(stream_name) = table_path.prefix().filename() {
+            // Let's just write directly to the catalog if we're creating tables for now.
+            // TODO: Might need to implement WAL for recovery for catalog too.
+            if stream_name.eq("catalog.parquet") {
+                return self.options()
+                    .format
+                    .create_writer_physical_plan(input, state, config, order_requirements)
+                    .await;
+            }
+            let parquet_sink = Arc::new(ParquetSink::new(config, TableParquetOptions::default()));
+
+            let cache_entry = MizuDiskManagerCacheEntry::new(
+                Arc::new(MizuWAL::new(Path::parse(table_path.prefix().to_string()).expect("REASON"), self.schema.clone())),
+                parquet_sink,
+                self.schema(),
+                0,
+            );
+            self.disk_manager.insert_if_not_exists(stream_name, cache_entry);
+
+            let sink = Arc::new(MizuDataSink {
+                schema: self.schema(),
+                stream_name: stream_name.parse().unwrap(),
+                disk_manager: self.disk_manager.clone(),
+            });
+
+            Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)))
+        } else {
+            plan_err!("Table path must have a filename")
+        }
     }
 }

@@ -6,6 +6,7 @@ mod data_sink;
 mod disk_manager;
 
 use crate::catalog::{MizuCatalog, MizuSchemaProvider};
+use crate::disk_manager::MizuDiskManager;
 use crate::object_store::{MizuObjectStore, MizuObjectStoreRegistry};
 use crate::table::MizuTable;
 use bytes::Bytes;
@@ -52,6 +53,7 @@ struct MizuDB {
     /// This ensures we have a single file for each database.
     database_table_providers_cache: Arc<RwLock<HashMap<String, Arc<dyn TableProvider>>>>,
     object_store: Arc<MizuObjectStore>,
+    disk_manager: Arc<MizuDiskManager>,
 }
 
 // TODO: Refactoring time!
@@ -59,6 +61,7 @@ impl MizuDB {
     async fn new(db_path: String) -> datafusion::error::Result<Self> {
         let path = format!("{}/mizudb_store", db_path);
         let table_path = format!("file://{}", path.as_str());
+        let disk_manager = Arc::new(MizuDiskManager::new().await);
         let catalog = Arc::new(MizuCatalog::new());
         let object_store = Arc::new(
             MizuObjectStore::new(path.as_str())
@@ -83,6 +86,7 @@ impl MizuDB {
             ObjectStoreUrl::parse("file://")?,
             catalog_file_source.clone(),
             catalog_file_table_path?,
+            disk_manager.clone(),
         ));
 
         let rt = Arc::new(
@@ -99,9 +103,8 @@ impl MizuDB {
         let table_ref = TableReference::full(DEFAULT_CATALOG, DEFAULT_SCHEMA, "mizudb_store");
         session_ctx.register_table(table_ref.clone(), catalog_table_provider.clone())?;
 
-        // TODO: Check if db file exists, if not create it, if it does load it in to the catalog.
+        // TODO: Refactor this and make it more modular
         if exists(path.as_str())? {
-            // Self::load_db(catalog).await
             let db = Self {
                 catalog: catalog.clone(),
                 catalog_table_provider,
@@ -109,6 +112,7 @@ impl MizuDB {
                 table_path,
                 database_table_providers_cache: Arc::new(Default::default()),
                 object_store: object_store.clone(),
+                disk_manager,
             };
 
             if let Some(cat) = object_store.load_catalog().await {
@@ -181,6 +185,7 @@ impl MizuDB {
                 table_path,
                 database_table_providers_cache: Arc::new(Default::default()),
                 object_store,
+                disk_manager,
             })
         }
     }
@@ -191,20 +196,6 @@ impl MizuDB {
 
     fn catalog(&self) -> &Arc<dyn CatalogProvider> {
         &self.catalog
-    }
-
-    async fn load_db(
-        catalog: Arc<dyn CatalogProvider>,
-        catalog_table_provider: Arc<dyn TableProvider>,
-    ) -> datafusion::error::Result<Self> {
-        Ok(Self {
-            catalog,
-            catalog_table_provider,
-            session_ctx: SessionContext::new(),
-            table_path: "".to_string(),
-            database_table_providers_cache: Arc::new(Default::default()),
-            object_store: Arc::new(MizuObjectStore::new("").await.unwrap()),
-        })
     }
 
     async fn files(&self) -> Vec<String> {
@@ -248,6 +239,7 @@ impl MizuDB {
                     Arc::from(ParquetSource::new(schema_ref.clone())),
                     ListingTableUrl::parse(&format!("{}/{}.parquet", self.table_path, file_stem))
                         .expect("ParquetTable URL"),
+                    self.disk_manager.clone(),
                 )))
                 .clone(),
             Err(err) => {
@@ -360,6 +352,7 @@ impl MizuDB {
                         .await?;
                     let stream =
                         execute_stream(physical_plan.clone(), self.ctx().task_ctx().clone())?;
+
                     let _ = collect(stream).await?;
                     Ok(Self::empty_df_ok(
                         self.ctx().clone().state(),

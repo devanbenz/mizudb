@@ -1,12 +1,14 @@
-use crate::data_sink::MizuDataSinkBuffer;
 use crate::wal::MizuWAL;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::file_format::parquet::ParquetSink;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use futures_util::{FutureExt, StreamExt};
-use log::info;
+use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot;
 
 pub(crate) enum MizuDataSinkJob {
     ParquetWrite {
@@ -20,99 +22,137 @@ pub(crate) enum MizuDataSinkJob {
     BufferWrite {
         record_batch: SendableRecordBatchStream,
         context: Arc<TaskContext>,
-        buffer: Arc<Mutex<Vec<MizuDataSinkBuffer>>>,
+        schema: SchemaRef,
         completion: oneshot::Sender<datafusion::common::Result<u64>>,
     },
+}
+
+type MizuDataSinkName = String;
+
+// TODO: Implement other types of sinks
+pub struct MizuDiskManagerCacheEntry {
+    wal: Arc<MizuWAL>,
+    parquet_sink: Arc<ParquetSink>,
+    record_batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    bytes_size: usize,
+}
+
+impl MizuDiskManagerCacheEntry {
+    pub fn new(wal: Arc<MizuWAL>, parquet_sink: Arc<ParquetSink>, schema: SchemaRef, bytes: usize) -> Self {
+        Self {
+            wal,
+            parquet_sink,
+            record_batches: vec![],
+            schema,
+            bytes_size: bytes,
+        }
+    }
 }
 
 const DEFAULT_NUM_THREADS: usize = 4;
 
 pub(crate) struct MizuDiskManager {
-    buffer: Arc<Mutex<Vec<MizuDataSinkBuffer>>>,
-    parquet_sink: Arc<ParquetSink>,
-    wal: Arc<MizuWAL>,
-    job_pool: Arc<Mutex<rayon::ThreadPool>>,
-    sender: mpsc::UnboundedSender<MizuDataSinkJob>,
-    receiver: Mutex<mpsc::UnboundedReceiver<MizuDataSinkJob>>,
+    sender: tokio::sync::mpsc::Sender<MizuDataSinkJob>,
+    cache: Arc<Mutex<HashMap<MizuDataSinkName, MizuDiskManagerCacheEntry>>>,
 }
 
 impl MizuDiskManager {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<MizuDataSinkJob>();
-        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(DEFAULT_NUM_THREADS).build().expect("Failed to create thread pool");
-        let disk_manager = Self { job_pool: Arc::new(Mutex::new(thread_pool)), sender: tx, receiver: Mutex::new(rx) };
-        disk_manager.start_background_sink_job().now_or_never();
-        disk_manager
+    pub async fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<MizuDataSinkJob>(DEFAULT_NUM_THREADS * 2);
+        let dm = Self {
+            sender: tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+        tokio::spawn(Self::start_background_sink_job(rx, dm.cache.clone()));
+        dm
     }
 
-    pub(crate) fn get_buffer(&self) -> Arc<Mutex<Vec<MizuDataSinkBuffer>>> {
-        self.buffer.clone()
+    pub(crate) fn get_wal(&self, name: &str) -> Arc<MizuWAL> {
+        self.cache.lock().unwrap().get(name).unwrap().wal.clone()
     }
 
-    pub(crate) fn get_wal(&self) -> Arc<MizuWAL> {
-        self.wal.clone()
+
+    pub(crate) fn insert_if_not_exists(&self, name: &str, entry: MizuDiskManagerCacheEntry) {
+        self.cache.lock().unwrap().entry(name.to_string()).or_insert(entry);
     }
 
-    pub(crate) fn get_parquet_sink(&self) -> Arc<ParquetSink> {
-        self.parquet_sink.clone()
+    pub(crate) fn get_parquet_sink(&self, name: &str) -> Arc<ParquetSink> {
+        self.cache
+            .lock()
+            .unwrap()
+            .get(name)
+            .unwrap()
+            .parquet_sink
+            .clone()
     }
 
-    async fn parquet_write_all(
-        &self,
-        data: SendableRecordBatchStream,
-        context: &Arc<TaskContext>,
-    ) -> datafusion::common::Result<u64> {
-        self.parquet_sink.write_all(data, context).await
-    }
-
-    pub(crate) fn send_job(&self, job: MizuDataSinkJob) -> datafusion::common::Result<()> {
-        match self.sender.clone().send(job) {
+    pub(crate) async fn send_job(&self, job: MizuDataSinkJob) -> datafusion::common::Result<()> {
+        println!("Sending job");
+        match self.sender.clone().send(job).await {
             Ok(_) => Ok(()),
-            Err(err) => {
-                Err(DataFusionError::Execution(format!("Failed to send job: {}", err)))
-            }
+            Err(err) => Err(DataFusionError::Execution(format!(
+                "Failed to send job: {}",
+                err
+            ))),
         }
     }
 
-    async fn receive_job(&self) -> MizuDataSinkJob {
-        self.receiver.lock().expect("Failed to lock receiver").recv().await.unwrap()
-    }
-
-    async fn start_background_sink_job(&self) {
-        loop {
-            let job = self.receive_job().await;
-            info!("Received job");
-            self.process_job(job).await;
+    pub(crate) async fn start_background_sink_job(
+        mut recv: Receiver<MizuDataSinkJob>,
+        cache: Arc<Mutex<HashMap<MizuDataSinkName, MizuDiskManagerCacheEntry>>>,
+    ) {
+        println!("Starting background job worker");
+        while let Some(item) = recv.recv().await {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                Self::process_job(item, cache).await;
+            });
         }
     }
 
-    async fn process_job(&self, job: MizuDataSinkJob) {
+    async fn process_job(
+        job: MizuDataSinkJob,
+        cache: Arc<Mutex<HashMap<MizuDataSinkName, MizuDiskManagerCacheEntry>>>,
+    ) {
         match job {
-            MizuDataSinkJob::BufferWrite { mut record_batch, context, buffer, completion } => {
+            MizuDataSinkJob::BufferWrite {
+                mut record_batch,
+                context,
+                completion,
+                schema,
+            } => {
+                let mut record_batches = vec![];
                 let mut count: u64 = 0;
-                let mut records = Vec::new();
-                match buffer.lock() {
-                    Ok(mut buffer) => {
-                        for record in record_batch.next().await {
-                            if let Err(err) = record {
-                                completion.send(Err(err)).unwrap();
-                                return;
-                            } else {
-                                records.push(record.unwrap());
-                                count += 1;
-                            }
-                        }
-
-                        buffer.push(MizuDataSinkBuffer { records, context });
-                    }
-                    Err(e) => {
-                        completion.send(Err(DataFusionError::Execution(format!("Failed to lock buffer: {}", e)))).unwrap();
+                while let Some(record) = record_batch.next().await {
+                    if let Err(err) = record {
+                        completion.send(Err(err)).unwrap();
                         return;
+                    } else {
+                        println!("{:#?}", record.iter().clone().collect::<Vec<_>>());
+                        record_batches.push(record.unwrap());
+                        count += 1;
                     }
                 }
+
                 completion.send(Ok(count)).unwrap();
             }
-            _ => unimplemented!(),
+            MizuDataSinkJob::WALWrite {
+                mut record_batch,
+                context,
+            } => {
+                let mut record_batches = vec![];
+                while let Some(record) = record_batch.next().await {
+                    if let Err(err) = record {
+                        println!("Error: {}", err);
+                        return;
+                    } else {
+                        record_batches.push(record.unwrap());
+                    }
+                }
+                let mut parquet_sink = cache.lock().unwrap().get_mut("parquet.parquet").unwrap().parquet_sink.clone();
+            }
+            _ => todo!()
         }
     }
 }
