@@ -6,6 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{plan_err, SchemaExt};
 use datafusion::config::TableParquetOptions;
+use datafusion::datasource::file_format::arrow::ArrowFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
@@ -44,6 +45,24 @@ impl MizuTable {
         disk_manager: Arc<MizuDiskManager>,
     ) -> Self {
         let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::new());
+        MizuTable {
+            schema,
+            file_source,
+            object_store_url,
+            table_paths: vec![table_path],
+            options: ListingOptions::new(format),
+            disk_manager,
+        }
+    }
+
+    pub fn new_arrow(
+        schema: SchemaRef,
+        object_store_url: ObjectStoreUrl,
+        file_source: Arc<dyn FileSource>,
+        table_path: ListingTableUrl,
+        disk_manager: Arc<MizuDiskManager>,
+    ) -> Self {
+        let format: Arc<dyn FileFormat> = Arc::new(ArrowFormat::default());
         MizuTable {
             schema,
             file_source,
