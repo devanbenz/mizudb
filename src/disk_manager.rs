@@ -14,15 +14,18 @@ pub(crate) enum MizuDataSinkJob {
     ParquetWrite {
         record_batch: SendableRecordBatchStream,
         context: Arc<TaskContext>,
+        stream_name: String,
     },
     WALWrite {
         record_batch: SendableRecordBatchStream,
         context: Arc<TaskContext>,
+        stream_name: String,
     },
     BufferWrite {
         record_batch: SendableRecordBatchStream,
         context: Arc<TaskContext>,
         schema: SchemaRef,
+        stream_name: String,
         completion: oneshot::Sender<datafusion::common::Result<u64>>,
     },
 }
@@ -39,7 +42,12 @@ pub struct MizuDiskManagerCacheEntry {
 }
 
 impl MizuDiskManagerCacheEntry {
-    pub fn new(wal: Arc<MizuWAL>, parquet_sink: Arc<ParquetSink>, schema: SchemaRef, bytes: usize) -> Self {
+    pub fn new(
+        wal: Arc<MizuWAL>,
+        parquet_sink: Arc<ParquetSink>,
+        schema: SchemaRef,
+        bytes: usize,
+    ) -> Self {
         Self {
             wal,
             parquet_sink,
@@ -72,9 +80,12 @@ impl MizuDiskManager {
         self.cache.lock().unwrap().get(name).unwrap().wal.clone()
     }
 
-
     pub(crate) fn insert_if_not_exists(&self, name: &str, entry: MizuDiskManagerCacheEntry) {
-        self.cache.lock().unwrap().entry(name.to_string()).or_insert(entry);
+        self.cache
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert(entry);
     }
 
     pub(crate) fn get_parquet_sink(&self, name: &str) -> Arc<ParquetSink> {
@@ -120,6 +131,7 @@ impl MizuDiskManager {
                 mut record_batch,
                 context,
                 completion,
+                stream_name,
                 schema,
             } => {
                 let mut record_batches = vec![];
@@ -140,6 +152,7 @@ impl MizuDiskManager {
             MizuDataSinkJob::WALWrite {
                 mut record_batch,
                 context,
+                stream_name,
             } => {
                 let mut record_batches = vec![];
                 while let Some(record) = record_batch.next().await {
@@ -150,9 +163,8 @@ impl MizuDiskManager {
                         record_batches.push(record.unwrap());
                     }
                 }
-                let mut parquet_sink = cache.lock().unwrap().get_mut("parquet.parquet").unwrap().parquet_sink.clone();
             }
-            _ => todo!()
+            _ => todo!(),
         }
     }
 }

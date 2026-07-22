@@ -62,11 +62,14 @@ impl DataSink for MizuDataSink {
         let (completion_sender, completion_receiver) =
             oneshot::channel::<datafusion::common::Result<u64>>();
         let schema = data.schema();
+        // TODO: Maybe use a &str instead of String
+        let stream_name = self.stream_name.clone();
         self.disk_manager
             .send_job(MizuDataSinkJob::BufferWrite {
                 record_batch: data,
                 context: context.clone(),
                 schema,
+                stream_name,
                 completion: completion_sender,
             })
             .await?;

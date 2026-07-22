@@ -4,25 +4,25 @@ use crate::wal::MizuWAL;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{plan_err, SchemaExt};
+use datafusion::common::{SchemaExt, plan_err};
 use datafusion::config::TableParquetOptions;
+use datafusion::datasource::TableType;
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::arrow::ArrowFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
 use datafusion::datasource::physical_plan::parquet::ParquetSink;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileOutputMode, FileScanConfigBuilder, FileSinkConfig, FileSource,
 };
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::datasource::TableType;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::execution_props::ExecutionProps;
-use datafusion::logical_expr::Expr;
-use datafusion::object_store::path::Path;
 use datafusion::object_store::ObjectStoreExt;
-use datafusion::physical_expr::{create_lex_ordering, LexOrdering};
+use datafusion::object_store::path::Path;
+use datafusion::physical_expr::{LexOrdering, create_lex_ordering};
 use datafusion::physical_plan::ExecutionPlan;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -186,7 +186,8 @@ impl TableProvider for MizuTable {
             // Let's just write directly to the catalog if we're creating tables for now.
             // TODO: Might need to implement WAL for recovery for catalog too.
             if stream_name.eq("catalog.parquet") {
-                return self.options()
+                return self
+                    .options()
                     .format
                     .create_writer_physical_plan(input, state, config, order_requirements)
                     .await;
@@ -194,12 +195,16 @@ impl TableProvider for MizuTable {
             let parquet_sink = Arc::new(ParquetSink::new(config, TableParquetOptions::default()));
 
             let cache_entry = MizuDiskManagerCacheEntry::new(
-                Arc::new(MizuWAL::new(Path::parse(table_path.prefix().to_string()).expect("REASON"), self.schema.clone())),
+                Arc::new(MizuWAL::new(
+                    Path::parse(table_path.prefix().to_string()).expect("Failed to get prefix"),
+                    self.schema.clone(),
+                )),
                 parquet_sink,
                 self.schema(),
                 0,
             );
-            self.disk_manager.insert_if_not_exists(stream_name, cache_entry);
+            self.disk_manager
+                .insert_if_not_exists(stream_name, cache_entry);
 
             let sink = Arc::new(MizuDataSink {
                 schema: self.schema(),
